@@ -279,7 +279,6 @@ const NOTIFY_EMAILS = [
   'samiwabasri@ahmadiyya.se', // the Gmail account this script downloads from
   'musab.rashid@ahmadiyya.se',
   'najeeb.rashid@ahmadiyya.se',
-  'samiwabasri_stockholm@ahmadiyya.se',
   'tarbiyyat@ahmadiyya.se',
 ]; // gets emailed the Drive link once translation is distributed — add more addresses here later
 const SENDERS = [
@@ -316,7 +315,7 @@ const ADMIN = { name: 'Fateh Shams (admin)', email: 'samiwabasri@ahmadiyya.se' }
 const APPROVER_EMAILS = APPROVERS.map(function(a) { return a.email; });
 const APPROVER_NAMES  = APPROVERS.map(function(a) { return a.name; });
 const MTA_RECIPIENT_EMAIL  = 'subtitling@mta.tv';        // approved file gets emailed here
-const SENT_TO_MTA_FOLDER_ID = '14PBjB_V8NEiWs5wSrwk-BWKRAtTVllu6'; // review Sheet moves here (renamed, " (review)" stripped) once approved & emailed
+const SENT_TO_MTA_FOLDER_ID = '14PBjB_V8NEiWs5wSrwk-BWKRAtTVllu6'; // clean .xlsx sent to MTA is filed here; the review Sheet is kept beside it as "(internal record)"
 
 // ====== YOUTUBE UPLOAD PACKAGE (for the MTA Svenska channel) ======
 // For every episode in the "This Week With Huzoor" YouTube playlist from
@@ -2178,28 +2177,31 @@ function sendApprovedFileToMta_(ss, approvedBy) {
   var meta = readReviewMeta_(ss);
   var outputName = meta.outputName || (ss.getName().replace(/\s*\(review\)$/i, '') + '.xlsx');
 
-  // Remove the "Approval" tab before exporting — it's internal workflow
-  // scaffolding, not subtitle content, so MTA should never see it. The review
-  // Sheet itself is trashed a few lines below anyway.
+  // MTA gets a CLEAN copy. Export from a temporary copy of the review Sheet
+  // with the "Approval" tab and the Status/Notes columns removed. Those show
+  // workflow and translation details (including what was done by AI), which
+  // MTA should never see. The review Sheet itself is kept intact as our
+  // internal record (see below), and the temporary copy is trashed right away.
+  var exportFile = DriveApp.getFileById(ss.getId()).makeCopy('__mta_export__' + Utilities.getUuid());
+  var xlsxBlob;
   try {
-    var approvalTab = ss.getSheetByName(APPROVAL_TAB_NAME);
-    if (approvalTab) {
-      ss.deleteSheet(approvalTab);
-      Logger.log('  Removed the "' + APPROVAL_TAB_NAME + '" tab before export.');
-    }
-  } catch (e) {
-    Logger.log('  WARNING: could not remove the "' + APPROVAL_TAB_NAME + '" tab - ' + e.message);
-  }
+    var exportSs = SpreadsheetApp.openById(exportFile.getId());
+    var approvalTab = exportSs.getSheetByName(APPROVAL_TAB_NAME);
+    if (approvalTab) exportSs.deleteSheet(approvalTab);
+    getDataSheet_(exportSs).deleteColumns(CONFIG.COL_STATUS, 2); // Status (I) and Notes (J)
 
-  SpreadsheetApp.flush();
-  var exportResp = UrlFetchApp.fetch(
-    'https://docs.google.com/spreadsheets/d/' + ss.getId() + '/export?format=xlsx',
-    { headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true }
-  );
-  if (exportResp.getResponseCode() !== 200) {
-    throw new Error('Export failed (' + exportResp.getResponseCode() + ')');
+    SpreadsheetApp.flush();
+    var exportResp = UrlFetchApp.fetch(
+      'https://docs.google.com/spreadsheets/d/' + exportFile.getId() + '/export?format=xlsx',
+      { headers: { 'Authorization': 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true }
+    );
+    if (exportResp.getResponseCode() !== 200) {
+      throw new Error('Export failed (' + exportResp.getResponseCode() + ')');
+    }
+    xlsxBlob = exportResp.getBlob().setName(outputName);
+  } finally {
+    exportFile.setTrashed(true);
   }
-  var xlsxBlob = exportResp.getBlob().setName(outputName);
 
   var subject = 'This Week With Huzoor - Swedish translation' +
     (meta.episodeDateFormatted ? ' - ' + meta.episodeDateFormatted : '');
@@ -2231,11 +2233,16 @@ function sendApprovedFileToMta_(ss, approvedBy) {
     var yearFolder = getOrCreateYearSubfolder_(sentRootFolder, year);
     deleteExisting_(yearFolder, outputName);
     yearFolder.createFile(xlsxBlob);
-    DriveApp.getFileById(ss.getId()).setTrashed(true); // review Sheet no longer needed — trashed, not permanently deleted
-    deleteTriggersForFile_(ss.getId());               // its Admin-menu trigger is no longer needed either
-    Logger.log('  Saved final "' + outputName + '" (.xlsx) to the ' + year + ' subfolder of the sent-to-MTA folder, and trashed the review Sheet.');
+    // Keep the review Sheet as our internal record, with the Approval tab and
+    // the Status/Notes columns. It's filed beside the MTA copy under a name that
+    // says it's not the MTA version.
+    var recordFile = DriveApp.getFileById(ss.getId());
+    recordFile.setName(outputName.replace(/\.xlsx$/i, '') + ' (internal record)');
+    recordFile.moveTo(yearFolder);
+    deleteTriggersForFile_(ss.getId());               // its Admin-menu trigger is no longer needed
+    Logger.log('  Saved final "' + outputName + '" (.xlsx) to the ' + year + ' subfolder of the sent-to-MTA folder, and filed the review Sheet there as the internal record.');
   } catch (e) {
-    Logger.log('  WARNING: could not save the final xlsx / remove the review Sheet - ' + e.message);
+    Logger.log('  WARNING: could not save the final xlsx / file the review Sheet - ' + e.message);
   }
 
   // Let everyone already tracking this pipeline know it went out.

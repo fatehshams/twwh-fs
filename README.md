@@ -37,3 +37,12 @@ clasp pull     # get latest from Google first
 clasp push     # upload to Apps Script
 ```
 Enable the Apps Script API once at https://script.google.com/home/usersettings. After pushing, run `installFrequentTrigger` if triggers/scopes changed.
+
+---
+
+# KM5 Sermons YouTube (`km5-sermons-youtube/`)
+Snapshot of the Apps Script **KM5 Sermons YouTube** (script ID `1a18rZvm6YQT6IBrHUYGD03TQ_VBDRlu6qZlYsTaudrFMiWl1Nz76qHNX`).
+It finds Huzoor's sermons/addresses on the MTA channel, sorts the Swedish MP4/MP3 files editors drop
+into "!DROP HERE - Final MP4 & MP3" into `04_KM5 Sermons/<year>/<yyyy_mm_Month>/<sermon>/`, and adds
+`<base>_thumbnail.jpg` + `<base>_metadata.xlsx` (Swedish title/description/tags via Gemini), plus a
+tracker sheet. Trigger: `runSermonPackages` every 5 min, real work hourly. Full guide in the file header.

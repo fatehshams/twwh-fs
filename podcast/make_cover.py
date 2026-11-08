@@ -1,3 +1,4 @@
+# Usage: python3 make_cover.py MedulaOne-Regular.ttf out.jpg 330 220 255 0.78 1  (font size, top y, line gap, width squeeze, stroke)
 import cv2, numpy as np, sys
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 D='/tmp/claude-0/-home-user-twwh-fs/d31a081f-9d13-5635-acab-4f78162195b0/scratchpad/'
@@ -14,14 +15,14 @@ blur=cv2.GaussianBlur(clean,(0,0),40)
 m3=cv2.GaussianBlur(cv2.dilate(mask,np.ones((61,61),np.uint8)),(0,0),20)[...,None]/255.
 clean=(clean*(1-m3)+blur*m3).astype(np.uint8)
 im=Image.fromarray(cv2.cvtColor(clean,cv2.COLOR_BGR2RGB)).convert('RGBA')
-SQ=float(sys.argv[6]); font=sys.argv[1]; out=sys.argv[2]
+SQ=float(sys.argv[6]); SW=int(sys.argv[7]); font=sys.argv[1]; out=sys.argv[2]
 cream=(236,226,218,255)
 def text(lines,fnt,x,y0,gap,fill,shadow=True):
     lay=Image.new('RGBA',im.size,(0,0,0,0)); d=ImageDraw.Draw(lay)
     y=y0
     for l in lines:
         w=int(d.textlength(l,font=fnt))+40; h=fnt.size*2
-        t=Image.new('RGBA',(w,h),(0,0,0,0)); ImageDraw.Draw(t).text((0,0),l,font=fnt,fill=fill)
+        t=Image.new('RGBA',(w,h),(0,0,0,0)); ImageDraw.Draw(t).text((0,0),l,font=fnt,fill=fill,stroke_width=SW,stroke_fill=fill)
         t=t.resize((int(w*SQ),h),Image.LANCZOS); lay.alpha_composite(t,(x,y)); y+=gap
     if shadow:
         sh=Image.new('RGBA',im.size,(0,0,0,0)); sh.putalpha(lay.getchannel('A').filter(ImageFilter.GaussianBlur(6)).point(lambda a:a*0.45))

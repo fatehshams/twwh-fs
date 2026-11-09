@@ -1087,6 +1087,98 @@ function findWaitingReviewSheetForEpisode_(sourceName) {
   return null;
 }
 
+// The version of this episode already approved and sent to MTA: its review Sheet,
+// kept in the Sent to MTA year folders as "<name> (internal record)". If there are
+// several (an earlier one was superseded), the most recently filed one. Or null.
+function findSentRecordForEpisode_(sourceName) {
+  var key = episodeKey_(sourceName);
+  if (!key) return null;
+  var best = null;
+  var years = DriveApp.getFolderById(SENT_TO_MTA_FOLDER_ID).getFolders();
+  while (years.hasNext()) {
+    var it = years.next().getFilesByType(MimeType.GOOGLE_SHEETS);
+    while (it.hasNext()) {
+      var f = it.next();
+      if (f.isTrashed() || episodeKey_(f.getName()) !== key) continue;
+      if (!/\(internal record\)\s*$/i.test(f.getName())) continue; // superseded records are renamed, so skipped
+      if (!best || f.getDateCreated() > best.getDateCreated()) best = f;
+    }
+  }
+  return best;
+}
+
+// Compares an updated English file with the rows already sent to MTA, one row at
+// a time. reason is '' when the rows line up (same count, same timecodes); else
+// why they don't. changed lists the row indexes whose English text changed.
+function compareSubtitleRows_(oldRows, newRows) {
+  if (newRows.length !== oldRows.length) {
+    return { reason: 'the number of subtitle rows changed (' + oldRows.length + ' → ' + newRows.length + ')', changed: [] };
+  }
+  var timing = 0, changed = [];
+  for (var i = 0; i < newRows.length; i++) {
+    if (newRows[i].start !== oldRows[i].start || newRows[i].end !== oldRows[i].end) timing++;
+    if (normalizeText_(newRows[i].en) !== normalizeText_(oldRows[i].en)) changed.push(i);
+  }
+  return {
+    reason : timing ? 'timecodes changed in ' + timing + ' row' + (timing === 1 ? '' : 's') : '',
+    changed: changed,
+  };
+}
+
+// Renames files of this name in the folder as "... (superseded <stamp>)" instead
+// of deleting them, so an earlier version sent to MTA stays on record.
+function supersedeExisting_(folder, name, stamp) {
+  var existing = folder.getFilesByName(name);
+  while (existing.hasNext()) {
+    var f = existing.next();
+    if (f.isTrashed()) continue;
+    f.setName(name.replace(/(\.xlsx)?$/i, ' (superseded ' + stamp + ')$1'));
+  }
+}
+
+// Top of the review email when the file updates a version already sent to MTA.
+function buildUpdateNoticePlain_(update) {
+  var flat = function(s) { return String(s || '').replace(/\n/g, ' / '); };
+  var lines = [
+    'UPDATE: a corrected version of this episode arrived after the version sent to MTA on ' + update.sentOn + '.',
+    'It is NOT sent to MTA until someone approves it in the review Sheet.',
+    '',
+  ];
+  if (update.reason) {
+    lines.push('The rows cannot be matched one-to-one with the sent version (' + update.reason +
+               '), so please check the whole episode against it.');
+  } else if (!update.changed.length) {
+    lines.push('The English and timecodes are unchanged.');
+  } else {
+    lines.push('Changed rows (' + update.changed.length + '):');
+    update.changed.forEach(function(c) {
+      lines.push('  Row ' + c.row + ':', '    Sent version: ' + flat(c.oldEn), '    Updated:      ' + flat(c.newEn));
+    });
+  }
+  return lines.join('\n') + '\n\n----------------------------------------\n\n';
+}
+
+function buildUpdateNoticeHtml_(update) {
+  var esc = escapeHtml_;
+  var body;
+  if (update.reason) {
+    body = 'The rows cannot be matched one-to-one with the sent version (' + esc(update.reason) +
+           '), so please check the whole episode against it.';
+  } else if (!update.changed.length) {
+    body = 'The English and timecodes are unchanged.';
+  } else {
+    body = update.changed.map(function(c) {
+      return '<div style="margin-top:8px; line-height:1.5;"><strong>Row ' + c.row + '</strong><br>' +
+             'Sent version: <s>' + esc(c.oldEn) + '</s><br>' +
+             'Updated: <strong>' + esc(c.newEn) + '</strong></div>';
+    }).join('');
+  }
+  return '<div style="font-family:Arial,Helvetica,sans-serif; max-width:600px; margin:0 auto 16px auto; padding:12px 16px; border-radius:4px; background:#fef7e0; color:#7c4a00; font-size:14px;">' +
+    '<strong>UPDATE to a version already sent to MTA</strong> (sent ' + esc(update.sentOn) + ').<br>' +
+    'It is NOT sent to MTA until someone approves it in the review Sheet.' +
+    '<div>' + body + '</div></div>';
+}
+
 // ── Corrections from MTA while a translation is in review ──────────────────
 // If more than this share of rows changed, it's treated as a new version
 // (full re-translation) rather than a few corrections.
@@ -1399,6 +1491,26 @@ function processFile_(srcFile, translatedFolder, archiveFolder, driveToken, skip
     var total   = Math.max(0, lastRow - CONFIG.DATA_START_ROW + 1);
     Logger.log('  Data rows: ' + total);
 
+    // If this episode was already sent to MTA, this file is an UPDATE to that
+    // version. Compare its English with the sent version, so the reviewers see
+    // exactly what changed before they approve it.
+    var update = null;
+    var sentRecord = findSentRecordForEpisode_(srcName);
+    if (sentRecord) {
+      var sentRows = readSubtitleRows_(getDataSheet_(SpreadsheetApp.openById(sentRecord.getId())));
+      var newRows  = readSubtitleRows_(sheet);
+      var cmp      = compareSubtitleRows_(sentRows, newRows);
+      update = {
+        sentOn: Utilities.formatDate(sentRecord.getDateCreated(), Session.getScriptTimeZone(), 'd MMMM yyyy'),
+        reason: cmp.reason,
+        changed: cmp.changed.map(function(i) {
+          return { row: CONFIG.DATA_START_ROW + i, oldEn: sentRows[i].en, newEn: newRows[i].en };
+        }),
+      };
+      Logger.log('  Update to a version already sent to MTA (' + update.sentOn + '): ' +
+                 (update.reason || update.changed.length + ' row(s) changed'));
+    }
+
     setupOutputColumns_(sheet, lastRow);
     var summary = {
       totalRows: total, batchCount: 0, modelCounts: {}, modelsUsed: [], fixedCount: 0,
@@ -1435,6 +1547,7 @@ function processFile_(srcFile, translatedFolder, archiveFolder, driveToken, skip
       originalName        : srcName,
       outputName          : outputName,
       episodeDateFormatted: episodeDateFormatted,
+      supersedesSent      : update ? update.sentOn : '',
     });
     createApprovalTab_(ss);
     var tmpFile = DriveApp.getFileById(tmpId);
@@ -1502,7 +1615,7 @@ function processFile_(srcFile, translatedFolder, archiveFolder, driveToken, skip
     if (skipNotification) {
       Logger.log('  Notification email skipped (manual test mode).');
     } else {
-      notifyTranslationReady_(outputName, srcName, summary, youtubeUrl, videoDuration, reviewSheetUrl);
+      notifyTranslationReady_(outputName, srcName, summary, youtubeUrl, videoDuration, reviewSheetUrl, update);
     }
 
   } finally {
@@ -1516,11 +1629,13 @@ function processFile_(srcFile, translatedFolder, archiveFolder, driveToken, skip
   }
 }
 
-function notifyTranslationReady_(outputName, originalName, summary, youtubeUrl, videoDuration, reviewSheetUrl) {
-  var subject = 'This Week With Huzoor translation ready: ' + outputName;
+function notifyTranslationReady_(outputName, originalName, summary, youtubeUrl, videoDuration, reviewSheetUrl, update) {
+  var subject = (update ? 'UPDATE to a version already sent to MTA: ' : 'This Week With Huzoor translation ready: ') + outputName;
   var configUrl = 'https://docs.google.com/spreadsheets/d/' + MASTER_SHEET_ID + '/edit';
-  var plainBody = buildNotificationPlainBody_(originalName, summary, configUrl, youtubeUrl, videoDuration, reviewSheetUrl);
-  var htmlBody = buildNotificationHtmlBody_(originalName, summary, configUrl, youtubeUrl, videoDuration, reviewSheetUrl);
+  var plainBody = (update ? buildUpdateNoticePlain_(update) : '') +
+    buildNotificationPlainBody_(originalName, summary, configUrl, youtubeUrl, videoDuration, reviewSheetUrl);
+  var htmlBody = (update ? buildUpdateNoticeHtml_(update) : '') +
+    buildNotificationHtmlBody_(originalName, summary, configUrl, youtubeUrl, videoDuration, reviewSheetUrl);
   var recipients = NOTIFY_EMAILS.join(',');
   try {
     MailApp.sendEmail(recipients, subject, plainBody, { htmlBody: htmlBody });
@@ -2205,8 +2320,12 @@ function sendApprovedFileToMta_(ss, approvedBy) {
   }
 
   var subject = 'This Week With Huzoor - Swedish translation' +
-    (meta.episodeDateFormatted ? ' - ' + meta.episodeDateFormatted : '');
+    (meta.episodeDateFormatted ? ' - ' + meta.episodeDateFormatted : '') +
+    (meta.supersedesSent ? ' (updated)' : '');
   var body = MTA_EMAIL_BODY_TEMPLATE.replace('{{FILENAME}}', outputName);
+  if (meta.supersedesSent) {
+    body = 'UPDATED version: this replaces the file sent on ' + meta.supersedesSent + '.\n\n' + body;
+  }
 
   MailApp.sendEmail(MTA_RECIPIENT_EMAIL, subject, body, { attachments: [xlsxBlob] });
   Logger.log('Approved file "' + outputName + '" emailed to ' + MTA_RECIPIENT_EMAIL + ' by ' + (approvedBy || 'unknown') + '.');
@@ -2232,7 +2351,10 @@ function sendApprovedFileToMta_(ss, approvedBy) {
     var year = extractYearFromName_(outputName) || extractYearFromName_(meta.originalName) ||
                String(new Date().getFullYear());
     var yearFolder = getOrCreateYearSubfolder_(sentRootFolder, year);
-    deleteExisting_(yearFolder, outputName);
+    // An earlier version of this episode stays on record as "(superseded ...)".
+    var stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HHmm');
+    supersedeExisting_(yearFolder, outputName, stamp);
+    supersedeExisting_(yearFolder, outputName.replace(/\.xlsx$/i, '') + ' (internal record)', stamp);
     yearFolder.createFile(xlsxBlob);
     // Keep the review Sheet as our internal record, with the Approval tab and
     // the Status/Notes columns. It's filed beside the MTA copy under a name that

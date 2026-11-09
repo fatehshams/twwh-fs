@@ -1073,15 +1073,16 @@ function isInFolder_(file, folder) {
 // same EPISODE as this English file — matched by the episode date at the start
 // of the name (e.g. 2026_10_09), so different naming styles of the same episode
 // count as the same. Returns the File, or null.
+// The date can sit anywhere in the name (MTA's updates arrive as e.g.
+// "updated_2026_11_06_TWWH_SWE.xlsx" or "2026_11_06_TWWH_v2.xlsx").
 function findWaitingReviewSheetForEpisode_(sourceName) {
-  var date = parseDateFromFilename_(sourceName);
-  if (!date) return null;
-  var prefix = Utilities.formatDate(date, 'UTC', 'yyyy_MM_dd') + '_';
+  var key = episodeKey_(sourceName);
+  if (!key) return null;
   var it = DriveApp.getFolderById(TRANSLATED_FOLDER_ID).getFilesByType(MimeType.GOOGLE_SHEETS);
   while (it.hasNext()) {
     var f = it.next();
     var n = f.getName();
-    if (!f.isTrashed() && n.indexOf(prefix) === 0 && /\(review\)\s*$/i.test(n)) return f;
+    if (!f.isTrashed() && episodeKey_(n) === key && /\(review\)\s*$/i.test(n)) return f;
   }
   return null;
 }
@@ -2066,12 +2067,12 @@ function readReviewMeta_(ss) {
   return meta;
 }
 
-// Pulls a leading "YYYY" year out of a filename like "2026_06_26_TWWH_SWE.xlsx"
-// (the same convention parseDateFromFilename_ relies on). Returns null if the
-// name doesn't start with a 4-digit year.
+// Pulls the year out of the episode date in a filename like
+// "2026_06_26_TWWH_SWE.xlsx" or "updated_2026_06_26_TWWH_SWE.xlsx" (see
+// parseDateFromFilename_). Returns null if the name has no date.
 function extractYearFromName_(name) {
-  var m = String(name || '').match(/^(\d{4})_/);
-  return m ? m[1] : null;
+  var d = parseDateFromFilename_(String(name || ''));
+  return d ? String(d.getUTCFullYear()) : null;
 }
 
 // Deletes this project's installable triggers that belong to one spreadsheet —
@@ -2261,11 +2262,12 @@ function sendApprovedFileToMta_(ss, approvedBy) {
 
 // ── YouTube episode lookup ──────────────────────────────────────────────────
 
-// Extracts a date from a filename that starts with "YYYY_MM_DD_" (e.g.
-// "2026_06_26_TWWH_ENG.xlsx"). Returns a UTC Date at midnight, or null if the
-// filename doesn't start with that pattern.
+// Extracts the episode date "YYYY_MM_DD" from a filename, wherever it appears
+// (e.g. "2026_06_26_TWWH_ENG.xlsx", "updated_2026_06_26_TWWH_SWE.xlsx",
+// "TWWH_2026_06_26_v2.xlsx"). The date must be a whole token, so longer numbers
+// don't match. Returns a UTC Date at midnight, or null if there is no date.
 function parseDateFromFilename_(filename) {
-  var m = filename.match(/^(\d{4})_(\d{2})_(\d{2})_/);
+  var m = String(filename || '').match(/(?:^|\D)(\d{4})_(\d{2})_(\d{2})(?!\d)/);
   if (!m) return null;
   var year = parseInt(m[1], 10), month = parseInt(m[2], 10), day = parseInt(m[3], 10);
   return new Date(Date.UTC(year, month - 1, day));

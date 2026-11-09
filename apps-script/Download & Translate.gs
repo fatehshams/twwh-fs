@@ -746,6 +746,15 @@ function finalizeApprovedFiles_() {
         continue;
       }
 
+      // SOURCE CHECK: the Sheet must be exactly the English version it was made
+      // from, and no newer English version may exist for this episode.
+      var sourceProblems = verifyAgainstLatestSource_(file, ss, meta);
+      if (sourceProblems.length) {
+        Logger.log('NOT sending "' + name + '" — version check failed: ' + sourceProblems.join(' | '));
+        rejectApprovalForSourceCheck_(file, ss, meta, approvedBy, sourceProblems);
+        continue;
+      }
+
       Logger.log('Finalizing approved review Sheet "' + name + '" — approved by ' + approvedBy +
                  ' (via ' + (checkboxBy ? 'checkbox' : 'approval flag') + ')...');
       sendApprovedFileToMta_(ss, approvedBy);
@@ -1274,6 +1283,7 @@ function applyCorrectionsToReviewSheet_(srcFile, srcName, reviewFile, archiveFol
     if (meta.approvalRequested === 'true') writeReviewMeta_(reviewSs, { approvalRequested: '' });
 
     sendCorrectionsAppliedEmail_(reviewFile, reviewSs, meta, srcName, oldRows, newRows, updates);
+    writeReviewMeta_(reviewSs, { sourceAppliedAt: String(srcFile.getDateCreated().getTime()) });
     archiveSourceAs_(srcFile, srcName, 'correction ' + stamp, archiveFolder);
     Logger.log('  Corrections merged: ' + updates.length + ' row(s) updated in "' + reviewFile.getName() + '".');
     return 'merged';
@@ -1548,6 +1558,7 @@ function processFile_(srcFile, translatedFolder, archiveFolder, driveToken, skip
       outputName          : outputName,
       episodeDateFormatted: episodeDateFormatted,
       supersedesSent      : update ? update.sentOn : '',
+      sourceAppliedAt     : String(srcFile.getDateCreated().getTime()), // which English file this review was made from
     });
     createApprovalTab_(ss);
     var tmpFile = DriveApp.getFileById(tmpId);
@@ -2075,6 +2086,114 @@ function rejectApprovalForLineLength_(file, ss, meta, approvedBy, problems) {
   }
 }
 
+// FINAL SOURCE CHECK before anything goes to MTA. Every row of the review Sheet
+// (timecodes and English) is compared with the English files for this episode:
+//   • the file this review was made from (meta.sourceAppliedAt) must match exactly;
+//   • every English file that arrived after it must match the Sheet exactly,
+//     otherwise a newer version exists and this Sheet is not it;
+//   • nothing for this episode may still be waiting in the download folder.
+// Returns a list of problems (empty = verified). Never sends or changes anything.
+function verifyAgainstLatestSource_(file, ss, meta) {
+  var key = episodeKey_(meta.originalName || meta.outputName || file.getName());
+  if (!key) return ['the episode date could not be read from the file name'];
+
+  var waiting = [];
+  var dl = DriveApp.getFolderById(DOWNLOAD_FOLDER_ID).getFiles();
+  while (dl.hasNext()) {
+    var d = dl.next();
+    if (!d.isTrashed() && episodeKey_(d.getName()) === key) waiting.push('"' + d.getName() + '"');
+  }
+  if (waiting.length) {
+    return ['a newer English file for this episode has arrived and is not translated yet: ' + waiting.join(', ')];
+  }
+
+  var appliedAt = parseInt(meta.sourceAppliedAt || '0', 10); // 0 = Sheet made before this check existed
+  var token = ScriptApp.getOAuthToken();
+  var sheetRows = readSubtitleRows_(getDataSheet_(ss));
+  var problems = [];
+  var applied = null;
+  var toCheck = [];
+  var arch = DriveApp.getFolderById(ORIGINAL_ARCHIVE_FOLDER_ID).getFiles();
+  while (arch.hasNext()) {
+    var a = arch.next();
+    if (a.isTrashed() || episodeKey_(a.getName()) !== key) continue;
+    var created = a.getDateCreated().getTime();
+    if (appliedAt && created === appliedAt) applied = a;
+    if (created > appliedAt) toCheck.push(a);
+  }
+  if (appliedAt && !applied) {
+    problems.push('the English file this review Sheet was made from is no longer in the archive');
+  }
+  if (applied) toCheck.unshift(applied);
+
+  toCheck.forEach(function(a) {
+    var differences = describeRowDifferences_(sheetRows, archivedRows_(a, token));
+    if (!differences.length) return;
+    var label = (a === applied) ? 'the review Sheet differs from the English file it was made from'
+                                : 'a newer English file differs from this review Sheet';
+    problems.push(label + ' ("' + a.getName() + '"): ' + differences.join('; '));
+  });
+  return problems;
+}
+
+// Subtitle rows of an archived English file, read the same way as the Sheet.
+function archivedRows_(file, token) {
+  var tmpId = convertToSheet_(file, token);
+  try {
+    return readSubtitleRows_(SpreadsheetApp.openById(tmpId).getSheets()[0]);
+  } finally {
+    deleteFile_(tmpId, token);
+  }
+}
+
+// Row-by-row differences between two lists of subtitle rows (at most 10 listed).
+function describeRowDifferences_(sheetRows, fileRows) {
+  if (sheetRows.length !== fileRows.length) {
+    return ['the Sheet has ' + sheetRows.length + ' rows, the file has ' + fileRows.length];
+  }
+  var out = [];
+  for (var i = 0; i < fileRows.length && out.length < 10; i++) {
+    var s = sheetRows[i], f = fileRows[i];
+    var sameTime = s.start === f.start && s.end === f.end;
+    var sameText = s.en.trim() === f.en.trim();
+    if (sameTime && sameText) continue;
+    out.push('row ' + (CONFIG.DATA_START_ROW + i) +
+              (sameTime ? '' : ' (timecode ' + s.start + '-' + s.end + ' vs ' + f.start + '-' + f.end + ')') +
+              (sameText ? '' : ' (Sheet: "' + s.en.trim() + '" / file: "' + f.en.trim() + '")'));
+  }
+  return out;
+}
+
+// Undoes an approval that failed the source check, and tells the group why.
+function rejectApprovalForSourceCheck_(file, ss, meta, approvedBy, problems) {
+  var when = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'd MMMM yyyy, HH:mm');
+  try {
+    var tab = ss.getSheetByName(APPROVAL_TAB_NAME);
+    if (tab) {
+      tab.getRange(APPROVAL_CHECKBOX_CELL).setValue(false);
+      tab.getRange(APPROVAL_REJECT_CELL).setValue(
+        'NOT SENT — the version check failed on ' + when + ': ' + problems.join(' | ') +
+        ' Fix it, then tick the box again.');
+    }
+    if (meta.approvalRequested === 'true') writeReviewMeta_(ss, { approvalRequested: '' });
+  } catch (e) {
+    Logger.log('  WARNING: could not undo the approval on "' + file.getName() + '" - ' + e.message);
+  }
+  try {
+    MailApp.sendEmail(
+      NOTIFY_EMAILS.join(','),
+      'NOT sent to MTA - version check failed: ' + file.getName(),
+      'The approval by ' + approvedBy + ' was undone. This review Sheet could not be verified against the ' +
+      'English file(s) for this episode, so it was not sent to MTA:\n\n' +
+      problems.map(function(p) { return '- ' + p; }).join('\n') +
+      '\n\nReview & approve (Google Sheet): ' + file.getUrl() +
+      '\nConfig spreadsheet: https://docs.google.com/spreadsheets/d/' + MASTER_SHEET_ID + '/edit'
+    );
+  } catch (e) {
+    Logger.log('  WARNING: could not send the version-check email for "' + file.getName() + '" - ' + e.message);
+  }
+}
+
 // The "rejected by the system" email to NOTIFY_EMAILS, listing each row to fix.
 function sendLineLengthRejectionEmail_(file, ss, meta, approvedBy, problems) {
   var episode = meta.outputName || (file.getName().replace(/\s*\(review\)\s*$/i, '') + '.xlsx');
@@ -2384,12 +2503,13 @@ function sendApprovedFileToMta_(ss, approvedBy) {
 
 // ── YouTube episode lookup ──────────────────────────────────────────────────
 
-// Extracts the episode date "YYYY_MM_DD" from a filename, wherever it appears
-// (e.g. "2026_06_26_TWWH_ENG.xlsx", "updated_2026_06_26_TWWH_SWE.xlsx",
-// "TWWH_2026_06_26_v2.xlsx"). The date must be a whole token, so longer numbers
-// don't match. Returns a UTC Date at midnight, or null if there is no date.
+// Extracts the episode date from a filename, wherever it appears, with "_", "-"
+// or "." between the parts (e.g. "2026_06_26_TWWH_ENG.xlsx",
+// "updated_2026-06-26_TWWH_SWE.xlsx", "TWWH_2026.06.26_v2.xlsx"). The date must
+// be a whole token, so longer numbers don't match. Returns a UTC Date at
+// midnight, or null if there is no date.
 function parseDateFromFilename_(filename) {
-  var m = String(filename || '').match(/(?:^|\D)(\d{4})_(\d{2})_(\d{2})(?!\d)/);
+  var m = String(filename || '').match(/(?:^|\D)(\d{4})[_.-](\d{2})[_.-](\d{2})(?!\d)/);
   if (!m) return null;
   var year = parseInt(m[1], 10), month = parseInt(m[2], 10), day = parseInt(m[3], 10);
   return new Date(Date.UTC(year, month - 1, day));
